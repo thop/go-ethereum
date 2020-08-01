@@ -23,7 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
+	"net/http"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -41,7 +41,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rpc"
-	"golang.org/x/net/websocket"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -49,7 +49,7 @@ const (
 	// history request.
 	historyUpdateRange = 50
 
-	// txChanSize is the size of channel listening to TxPreEvent.
+	// txChanSize is the size of channel listening to NewTxsEvent.
 	// The number is referenced from the size of tx pool.
 	txChanSize = 4096
 	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
@@ -57,9 +57,9 @@ const (
 )
 
 type txPool interface {
-	// SubscribeTxPreEvent should return an event subscription of
-	// TxPreEvent and send events to the given channel.
-	SubscribeTxPreEvent(chan<- core.TxPreEvent) event.Subscription
+	// SubscribeNewTxsEvent should return an event subscription of
+	// NewTxsEvent and send events to the given channel.
+	SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription
 }
 
 type blockChain interface {
@@ -150,11 +150,11 @@ func (s *Service) loop() {
 	headSub := blockchain.SubscribeChainHeadEvent(chainHeadCh)
 	defer headSub.Unsubscribe()
 
-	txEventCh := make(chan core.TxPreEvent, txChanSize)
-	txSub := txpool.SubscribeTxPreEvent(txEventCh)
+	txEventCh := make(chan core.NewTxsEvent, txChanSize)
+	txSub := txpool.SubscribeNewTxsEvent(txEventCh)
 	defer txSub.Unsubscribe()
 
-	// Start a goroutine that exhausts the subsciptions to avoid events piling up
+	// Start a goroutine that exhausts the subscriptions to avoid events piling up
 	var (
 		quitCh = make(chan struct{})
 		headCh = make(chan *types.Block, 1)
@@ -193,84 +193,98 @@ func (s *Service) loop() {
 			}
 		}
 		close(quitCh)
-		return
 	}()
+
+	// Resolve the URL, defaulting to TLS, but falling back to none too
+	path := fmt.Sprintf("%s/api", s.host)
+	urls := []string{path}
+
+	// url.Parse and url.IsAbs is unsuitable (https://github.com/golang/go/issues/19779)
+	if !strings.Contains(path, "://") {
+		urls = []string{"wss://" + path, "ws://" + path}
+	}
+
+	errTimer := time.NewTimer(0)
+	defer errTimer.Stop()
 	// Loop reporting until termination
 	for {
-		// Resolve the URL, defaulting to TLS, but falling back to none too
-		path := fmt.Sprintf("%s/api", s.host)
-		urls := []string{path}
-
-		if !strings.Contains(path, "://") { // url.Parse and url.IsAbs is unsuitable (https://github.com/golang/go/issues/19779)
-			urls = []string{"wss://" + path, "ws://" + path}
-		}
-		// Establish a websocket connection to the server on any supported URL
-		var (
-			conf *websocket.Config
-			conn *websocket.Conn
-			err  error
-		)
-		for _, url := range urls {
-			if conf, err = websocket.NewConfig(url, "http://localhost/"); err != nil {
+		select {
+		case <-quitCh:
+			return
+		case <-errTimer.C:
+			// Establish a websocket connection to the server on any supported URL
+			var (
+				conn *websocket.Conn
+				err  error
+			)
+			dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+			header := make(http.Header)
+			header.Set("origin", "http://localhost")
+			for _, url := range urls {
+				conn, _, err = dialer.Dial(url, header)
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				log.Warn("Stats server unreachable", "err", err)
+				errTimer.Reset(10 * time.Second)
 				continue
 			}
-			conf.Dialer = &net.Dialer{Timeout: 5 * time.Second}
-			if conn, err = websocket.DialConfig(conf); err == nil {
-				break
-			}
-		}
-		if err != nil {
-			log.Warn("Stats server unreachable", "err", err)
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		// Authenticate the client with the server
-		if err = s.login(conn); err != nil {
-			log.Warn("Stats login failed", "err", err)
-			conn.Close()
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		go s.readLoop(conn)
-
-		// Send the initial stats so our node looks decent from the get go
-		if err = s.report(conn); err != nil {
-			log.Warn("Initial stats report failed", "err", err)
-			conn.Close()
-			continue
-		}
-		// Keep sending status updates until the connection breaks
-		fullReport := time.NewTicker(15 * time.Second)
-
-		for err == nil {
-			select {
-			case <-quitCh:
+			// Authenticate the client with the server
+			if err = s.login(conn); err != nil {
+				log.Warn("Stats login failed", "err", err)
 				conn.Close()
-				return
+				errTimer.Reset(10 * time.Second)
+				continue
+			}
+			go s.readLoop(conn)
 
-			case <-fullReport.C:
-				if err = s.report(conn); err != nil {
-					log.Warn("Full stats report failed", "err", err)
-				}
-			case list := <-s.histCh:
-				if err = s.reportHistory(conn, list); err != nil {
-					log.Warn("Requested history report failed", "err", err)
-				}
-			case head := <-headCh:
-				if err = s.reportBlock(conn, head); err != nil {
-					log.Warn("Block stats report failed", "err", err)
-				}
-				if err = s.reportPending(conn); err != nil {
-					log.Warn("Post-block transaction stats report failed", "err", err)
-				}
-			case <-txCh:
-				if err = s.reportPending(conn); err != nil {
-					log.Warn("Transaction stats report failed", "err", err)
+			// Send the initial stats so our node looks decent from the get go
+			if err = s.report(conn); err != nil {
+				log.Warn("Initial stats report failed", "err", err)
+				conn.Close()
+				errTimer.Reset(0)
+				continue
+			}
+			// Keep sending status updates until the connection breaks
+			fullReport := time.NewTicker(15 * time.Second)
+
+			for err == nil {
+				select {
+				case <-quitCh:
+					fullReport.Stop()
+					// Make sure the connection is closed
+					conn.Close()
+					return
+
+				case <-fullReport.C:
+					if err = s.report(conn); err != nil {
+						log.Warn("Full stats report failed", "err", err)
+					}
+				case list := <-s.histCh:
+					if err = s.reportHistory(conn, list); err != nil {
+						log.Warn("Requested history report failed", "err", err)
+					}
+				case head := <-headCh:
+					if err = s.reportBlock(conn, head); err != nil {
+						log.Warn("Block stats report failed", "err", err)
+					}
+					if err = s.reportPending(conn); err != nil {
+						log.Warn("Post-block transaction stats report failed", "err", err)
+					}
+				case <-txCh:
+					if err = s.reportPending(conn); err != nil {
+						log.Warn("Transaction stats report failed", "err", err)
+					}
 				}
 			}
+			fullReport.Stop()
+
+			// Close the current connection and establish a new one
+			conn.Close()
+			errTimer.Reset(0)
 		}
-		// Make sure the connection is closed
-		conn.Close()
 	}
 }
 
@@ -284,8 +298,23 @@ func (s *Service) readLoop(conn *websocket.Conn) {
 
 	for {
 		// Retrieve the next generic network packet and bail out on error
+		var blob json.RawMessage
+		if err := conn.ReadJSON(&blob); err != nil {
+			log.Warn("Failed to retrieve stats server message", "err", err)
+			return
+		}
+		// If the network packet is a system ping, respond to it directly
+		var ping string
+		if err := json.Unmarshal(blob, &ping); err == nil && strings.HasPrefix(ping, "primus::ping::") {
+			if err := conn.WriteJSON(strings.Replace(ping, "ping", "pong", -1)); err != nil {
+				log.Warn("Failed to respond to system ping message", "err", err)
+				return
+			}
+			continue
+		}
+		// Not a system ping, try to decode an actual state message
 		var msg map[string][]interface{}
-		if err := websocket.JSON.Receive(conn, &msg); err != nil {
+		if err := json.Unmarshal(blob, &msg); err != nil {
 			log.Warn("Failed to decode stats server message", "err", err)
 			return
 		}
@@ -317,8 +346,11 @@ func (s *Service) readLoop(conn *websocket.Conn) {
 			request, ok := msg["emit"][1].(map[string]interface{})
 			if !ok {
 				log.Warn("Invalid stats history request", "msg", msg["emit"][1])
-				s.histCh <- nil
-				continue // Ethstats sometime sends invalid history requests, ignore those
+				select {
+				case s.histCh <- nil: // Treat it as an no indexes request
+				default:
+				}
+				continue
 			}
 			list, ok := request["list"].([]interface{})
 			if !ok {
@@ -346,7 +378,7 @@ func (s *Service) readLoop(conn *websocket.Conn) {
 	}
 }
 
-// nodeInfo is the collection of metainformation about a node that is displayed
+// nodeInfo is the collection of meta information about a node that is displayed
 // on the monitoring page.
 type nodeInfo struct {
 	Name     string `json:"name"`
@@ -363,7 +395,7 @@ type nodeInfo struct {
 
 // authMsg is the authentication infos needed to login to a monitoring server.
 type authMsg struct {
-	Id     string   `json:"id"`
+	ID     string   `json:"id"`
 	Info   nodeInfo `json:"info"`
 	Secret string   `json:"secret"`
 }
@@ -375,14 +407,14 @@ func (s *Service) login(conn *websocket.Conn) error {
 
 	var network, protocol string
 	if info := infos.Protocols["eth"]; info != nil {
-		network = fmt.Sprintf("%d", info.(*eth.EthNodeInfo).Network)
+		network = fmt.Sprintf("%d", info.(*eth.NodeInfo).Network)
 		protocol = fmt.Sprintf("eth/%d", eth.ProtocolVersions[0])
 	} else {
-		network = fmt.Sprintf("%d", infos.Protocols["les"].(*eth.EthNodeInfo).Network)
-		protocol = fmt.Sprintf("les/%d", les.ProtocolVersions[0])
+		network = fmt.Sprintf("%d", infos.Protocols["les"].(*les.NodeInfo).Network)
+		protocol = fmt.Sprintf("les/%d", les.ClientProtocolVersions[0])
 	}
 	auth := &authMsg{
-		Id: s.node,
+		ID: s.node,
 		Info: nodeInfo{
 			Name:     s.node,
 			Node:     infos.Name,
@@ -400,12 +432,12 @@ func (s *Service) login(conn *websocket.Conn) error {
 	login := map[string][]interface{}{
 		"emit": {"hello", auth},
 	}
-	if err := websocket.JSON.Send(conn, login); err != nil {
+	if err := conn.WriteJSON(login); err != nil {
 		return err
 	}
 	// Retrieve the remote ack or connection termination
 	var ack map[string][]string
-	if err := websocket.JSON.Receive(conn, &ack); err != nil || len(ack["emit"]) != 1 || ack["emit"][0] != "ready" {
+	if err := conn.ReadJSON(&ack); err != nil || len(ack["emit"]) != 1 || ack["emit"][0] != "ready" {
 		return errors.New("unauthorized")
 	}
 	return nil
@@ -442,7 +474,7 @@ func (s *Service) reportLatency(conn *websocket.Conn) error {
 			"clientTime": start.String(),
 		}},
 	}
-	if err := websocket.JSON.Send(conn, ping); err != nil {
+	if err := conn.WriteJSON(ping); err != nil {
 		return err
 	}
 	// Wait for the pong request to arrive back
@@ -464,7 +496,7 @@ func (s *Service) reportLatency(conn *websocket.Conn) error {
 			"latency": latency,
 		}},
 	}
-	return websocket.JSON.Send(conn, stats)
+	return conn.WriteJSON(stats)
 }
 
 // blockStats is the information to report about individual blocks.
@@ -474,8 +506,8 @@ type blockStats struct {
 	ParentHash common.Hash    `json:"parentHash"`
 	Timestamp  *big.Int       `json:"timestamp"`
 	Miner      common.Address `json:"miner"`
-	GasUsed    *big.Int       `json:"gasUsed"`
-	GasLimit   *big.Int       `json:"gasLimit"`
+	GasUsed    uint64         `json:"gasUsed"`
+	GasLimit   uint64         `json:"gasLimit"`
 	Diff       string         `json:"difficulty"`
 	TotalDiff  string         `json:"totalDifficulty"`
 	Txs        []txStats      `json:"transactions"`
@@ -500,7 +532,7 @@ func (s uncleStats) MarshalJSON() ([]byte, error) {
 	return []byte("[]"), nil
 }
 
-// reportBlock retrieves the current chain head and repors it to the stats server.
+// reportBlock retrieves the current chain head and reports it to the stats server.
 func (s *Service) reportBlock(conn *websocket.Conn, block *types.Block) error {
 	// Gather the block details from the header or block chain
 	details := s.assembleBlockStats(block)
@@ -515,7 +547,7 @@ func (s *Service) reportBlock(conn *websocket.Conn, block *types.Block) error {
 	report := map[string][]interface{}{
 		"emit": {"block", stats},
 	}
-	return websocket.JSON.Send(conn, report)
+	return conn.WriteJSON(report)
 }
 
 // assembleBlockStats retrieves any required metadata to report a single block
@@ -558,10 +590,10 @@ func (s *Service) assembleBlockStats(block *types.Block) *blockStats {
 		Number:     header.Number,
 		Hash:       header.Hash(),
 		ParentHash: header.ParentHash,
-		Timestamp:  header.Time,
+		Timestamp:  new(big.Int).SetUint64(header.Time),
 		Miner:      author,
-		GasUsed:    new(big.Int).Set(header.GasUsed),
-		GasLimit:   new(big.Int).Set(header.GasLimit),
+		GasUsed:    header.GasUsed,
+		GasLimit:   header.GasLimit,
 		Diff:       header.Difficulty.String(),
 		TotalDiff:  td.String(),
 		Txs:        txs,
@@ -614,6 +646,7 @@ func (s *Service) reportHistory(conn *websocket.Conn, list []uint64) error {
 		}
 		// Ran out of blocks, cut the report short and send
 		history = history[len(history)-i:]
+		break
 	}
 	// Assemble the history report and send it to the server
 	if len(history) > 0 {
@@ -628,7 +661,7 @@ func (s *Service) reportHistory(conn *websocket.Conn, list []uint64) error {
 	report := map[string][]interface{}{
 		"emit": {"history", stats},
 	}
-	return websocket.JSON.Send(conn, report)
+	return conn.WriteJSON(report)
 }
 
 // pendStats is the information to report about pending transactions.
@@ -658,7 +691,7 @@ func (s *Service) reportPending(conn *websocket.Conn) error {
 	report := map[string][]interface{}{
 		"emit": {"pending", stats},
 	}
-	return websocket.JSON.Send(conn, report)
+	return conn.WriteJSON(report)
 }
 
 // nodeStats is the information to report about the local node.
@@ -689,7 +722,7 @@ func (s *Service) reportStats(conn *websocket.Conn) error {
 		sync := s.eth.Downloader().Progress()
 		syncing = s.eth.BlockChain().CurrentHeader().Number.Uint64() >= sync.HighestBlock
 
-		price, _ := s.eth.ApiBackend.SuggestPrice(context.Background())
+		price, _ := s.eth.APIBackend.SuggestPrice(context.Background())
 		gasprice = int(price.Uint64())
 	} else {
 		sync := s.les.Downloader().Progress()
@@ -713,5 +746,5 @@ func (s *Service) reportStats(conn *websocket.Conn) error {
 	report := map[string][]interface{}{
 		"emit": {"stats", stats},
 	}
-	return websocket.JSON.Send(conn, report)
+	return conn.WriteJSON(report)
 }
